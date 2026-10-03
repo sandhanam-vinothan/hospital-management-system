@@ -21,6 +21,7 @@ async function init(){
  CREATE TABLE IF NOT EXISTS medical_records(id BIGSERIAL PRIMARY KEY,patient_id BIGINT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,doctor_id BIGINT REFERENCES doctors(id),appointment_id BIGINT REFERENCES appointments(id),diagnosis TEXT,symptoms TEXT,treatment TEXT,notes TEXT,created_at TIMESTAMPTZ DEFAULT NOW());
  CREATE TABLE IF NOT EXISTS bills(id BIGSERIAL PRIMARY KEY,patient_id BIGINT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,appointment_id BIGINT REFERENCES appointments(id),amount NUMERIC(12,2) DEFAULT 0,payment_method VARCHAR(30),payment_status VARCHAR(30) DEFAULT 'pending',description TEXT,created_at TIMESTAMPTZ DEFAULT NOW(),paid_at TIMESTAMPTZ);
  CREATE TABLE IF NOT EXISTS audit_logs(id BIGSERIAL PRIMARY KEY,user_id BIGINT REFERENCES users(id),action VARCHAR(160) NOT NULL,entity_type VARCHAR(80),entity_id BIGINT,details JSONB,created_at TIMESTAMPTZ DEFAULT NOW());
+ CREATE TABLE IF NOT EXISTS password_reset_requests(id BIGSERIAL PRIMARY KEY,email VARCHAR(255) NOT NULL,status VARCHAR(30) DEFAULT 'pending',created_at TIMESTAMPTZ DEFAULT NOW());
  ALTER TABLE doctors ADD COLUMN IF NOT EXISTS department VARCHAR(120);
  ALTER TABLE doctors ADD COLUMN IF NOT EXISTS qualification VARCHAR(180);
  ALTER TABLE doctors ADD COLUMN IF NOT EXISTS consultation_fee NUMERIC(12,2) DEFAULT 0;
@@ -38,6 +39,30 @@ const server=http.createServer(async(req,res)=>{
   let b=await body(req);
   if(p==="/api/health"){let x=await query("select current_database() database,now() time");return send(res,200,{ok:true,database:"Neon PostgreSQL",databaseName:x.rows[0].database,time:x.rows[0].time})}
   if(p==="/api/login"&&m==="POST"){let e=String(b.email||"").toLowerCase(),r=await query("select * from users where lower(email)=lower($1) and active=true",[e]),u=r.rows[0];if(!u||!await bcrypt.compare(String(b.password||""),u.password_hash))return send(res,401,{error:"Wrong email or password"});await audit(u.id,"login","users",u.id);return send(res,200,{token:token(u.id),user:{id:u.id,name:u.name,email:u.email,role:u.role}})}
+
+  if(p==="/api/signup"&&m==="POST"){
+   let name=String(b.name||"").trim(),email=String(b.email||"").trim().toLowerCase(),pw=String(b.password||""),phone=String(b.phone||"").trim();
+   if(!name||!email.includes("@")||pw.length<8)return send(res,400,{error:"Enter your name, a valid email and a password of at least 8 characters"});
+   let c=await pool.connect();
+   try{
+    await c.query("begin");
+    let h=await bcrypt.hash(pw,12);
+    let ur=await c.query("insert into users(name,email,password_hash,role,phone) values($1,$2,$3,'patient',$4) returning id,name,email,role,phone",[name,email,h,phone||null]);
+    let x=ur.rows[0];
+    await c.query("insert into patients(user_id,patient_code,name,email,phone) values($1,$2,$3,$4,$5)",[x.id,"PAT-"+String(x.id).padStart(5,"0"),x.name,x.email,x.phone]);
+    await c.query("commit");
+    await audit(x.id,"signup","users",x.id,{role:"patient"});
+    return send(res,201,{token:token(x.id),user:x});
+   }catch(e){await c.query("rollback");throw e}finally{c.release()}
+  }
+  if(p==="/api/forgot-password"&&m==="POST"){
+   let email=String(b.email||"").trim().toLowerCase();
+   if(!email||!email.includes("@"))return send(res,400,{error:"Enter a valid email address"});
+   let exists=await query("select id from users where lower(email)=lower($1)",[email]);
+   if(exists.rows.length)await query("insert into password_reset_requests(email) values($1)",[email]);
+   return send(res,200,{ok:true,message:"If the account exists, the password-reset request has been recorded. Contact the hospital administrator to receive a new password."});
+  }
+
   let u=await me(req);if(!u)return send(res,401,{error:"Please sign in again"});
   if(p==="/api/me")return send(res,200,{user:u});
   if(p==="/api/doctors"&&m==="GET"){let r=await query("select d.id,d.user_id,d.doctor_code,d.name,d.specialization,d.department,d.qualification,d.consultation_fee,d.available_days,d.available_from,d.available_to,d.email,d.phone,coalesce(u.active,true) active from doctors d left join users u on u.id=d.user_id where u.active=true or d.user_id is null order by d.name");return send(res,200,r.rows)}
@@ -59,6 +84,7 @@ const server=http.createServer(async(req,res)=>{
   if(p==="/api/prescriptions"&&m==="GET"){let q=`select pr.*,p.name patient_name,d.name doctor_name from prescriptions pr join patients p on p.id=pr.patient_id left join doctors d on d.id=pr.doctor_id`,a=[];if(u.role==="patient"){q+=" where p.user_id=$1";a=[u.id]}return send(res,200,(await query(q+" order by pr.created_at desc",a)).rows)}
   if(p==="/api/records"&&m==="GET"){let q=`select mr.*,p.name patient_name,d.name doctor_name from medical_records mr join patients p on p.id=mr.patient_id left join doctors d on d.id=mr.doctor_id`,a=[];if(u.role==="patient"){q+=" where p.user_id=$1";a=[u.id]}return send(res,200,(await query(q+" order by mr.created_at desc",a)).rows)}
   if(p==="/api/bills"&&m==="GET"){let q=`select b.*,p.name patient_name from bills b join patients p on p.id=b.patient_id`,a=[];if(u.role==="patient"){q+=" where p.user_id=$1";a=[u.id]}return send(res,200,(await query(q+" order by b.created_at desc",a)).rows)}
+  if(p==="/api/reset-requests"&&m==="GET"){if(!allow(u,"admin"))return send(res,403,{error:"Access denied"});return send(res,200,(await query("select * from password_reset_requests where status='pending' order by created_at desc limit 50")).rows)}
   if(p==="/api/audit"&&m==="GET"){if(!allow(u,"admin"))return send(res,403,{error:"Access denied"});return send(res,200,(await query("select a.*,coalesce(u.name,'System') user_name from audit_logs a left join users u on u.id=a.user_id order by a.created_at desc limit 100")).rows)}
   return send(res,404,{error:"API route not found"});
  }catch(e){console.error(e);return send(res,500,{error:e.code==="23505"?"That email/code already exists":"Server error"})}
