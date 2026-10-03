@@ -22,3 +22,7 @@ temp/
 
 # Local database / development data
 data/db.json
+
+# Local development / backup files
+server-json-backup.js
+test-neon.js

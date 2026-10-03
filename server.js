@@ -1,84 +1,1086 @@
-// MediCare HMS backend - Node 18+, zero dependencies, JWT roles, JSON-file storage
-const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto');
-const E=process.env,PORT=+E.PORT||3100,DATA=path.join(E.DATA_DIR||__dirname,'data');
-fs.mkdirSync(DATA,{recursive:true});
-let SECRET=E.JWT_SECRET;if(!SECRET){const f=path.join(DATA,'secret');try{SECRET=fs.readFileSync(f,'utf8')}catch{SECRET=crypto.randomBytes(32).toString('hex');fs.writeFileSync(f,SECRET,{mode:0o600})}}
-const b64=o=>Buffer.from(typeof o==='string'?o:JSON.stringify(o)).toString('base64url'),sig=s=>crypto.createHmac('sha256',SECRET).update(s).digest('base64url');
-const sign=i=>{const s=b64({alg:'HS256',typ:'JWT'})+'.'+b64({sub:i,exp:Math.floor(Date.now()/1e3)+86400});return s+'.'+sig(s)};
-const verify=t=>{try{const[h,p,s]=String(t).split('.'),m=sig(h+'.'+p);if(!s||s.length!==m.length||!crypto.timingSafeEqual(Buffer.from(s),Buffer.from(m)))return null;const o=JSON.parse(Buffer.from(p,'base64url'));return o.exp*1e3>Date.now()?o.sub:null}catch{return null}};
-const hpw=(pw,salt)=>crypto.scryptSync(pw,salt,64).toString('hex'),id=()=>crypto.randomBytes(5).toString('hex');
-/* ---------- storage ---------- */
-const F=path.join(DATA,'db.json');let db;try{db=JSON.parse(fs.readFileSync(F,'utf8'))}catch{db=null}
-const save=()=>{fs.writeFileSync(F+'.tmp',JSON.stringify(db));fs.renameSync(F+'.tmp',F)};
-const mkU=(name,email,role,pw)=>{const salt=crypto.randomBytes(16).toString('hex');return{id:id(),name,email,role,salt,hash:hpw(pw,salt),active:true,at:Date.now()}};
-if(!db){db={users:[],patients:[],appointments:[],records:[],medicines:[],bills:[],audit:[]};
- [['Admin','admin@hospital.local','admin','Admin@123'],['Dr. Meena','doctor@hospital.local','doctor','Doctor@123'],['Reception Desk','reception@hospital.local','reception','Reception@123'],['Pharmacist','pharmacy@hospital.local','pharmacist','Pharma@123']].forEach(a=>db.users.push(mkU(...a)));
- [['Paracetamol 500mg',200,2,'2028-12-31'],['Amoxicillin 250mg',80,8,'2027-06-30'],['Cetirizine 10mg',8,3,'2027-03-31']].forEach(m=>db.medicines.push({id:id(),name:m[0],stock:m[1],price:m[2],expiry:m[3],at:Date.now()}));save()}
-/* ---------- rules ---------- */
-const D=/^\d{4}-\d{2}-\d{2}$/,T=/^\d{2}:\d{2}$/,N=v=>v!==''&&v!=null&&isFinite(v)&&+v>=0,ROLES=['admin','doctor','reception','pharmacist'];
-const pt=b=>db.patients.some(p=>p.id===b.patientId),NB=['consultation','medicine','other','discount','taxPct'];
-const tot=b=>+((+b.consultation+ +b.medicine+ +b.other-+b.discount)*(1+b.taxPct/100)).toFixed(2);
-const S={
- patients:{r:'admin,reception,doctor',w:'admin,reception',pick:['name','age','gender','phone','address'],num:['age'],
-  chk:b=>!String(b.name||'').trim()?'Name is required':!(N(b.age)&&+b.age<=130)?'Valid age required':!/^\d{10}$/.test(String(b.phone||''))?'Phone must be 10 digits':null},
- appointments:{r:'admin,reception,doctor',w:'admin,reception',pick:['patientId','doctor','date','time','status'],
-  chk:(b,x)=>!pt(b)?'Select a patient':!db.users.some(u=>u.id===b.doctor&&u.role==='doctor'&&u.active)?'Select a doctor':!D.test(b.date||'')||!T.test(b.time||'')?'Date and time required':!['Booked','Completed','Cancelled'].includes(b.status)?'Bad status':b.status!=='Cancelled'&&db.appointments.some(a=>a.id!==(x&&x.id)&&a.doctor===b.doctor&&a.date===b.date&&a.time===b.time&&a.status!=='Cancelled')?'Doctor already booked at that time':null},
- records:{r:'doctor',w:'doctor',pick:['patientId','diagnosis','treatment','medicineId','qty'],num:['qty'],
-  chk:b=>!pt(b)?'Select a patient':!String(b.diagnosis||'').trim()?'Diagnosis is required':b.medicineId&&!(db.medicines.some(m=>m.id===b.medicineId)&&+b.qty>0)?'Valid medicine and quantity required':null},
- medicines:{r:'admin,pharmacist,doctor',w:'admin,pharmacist',pick:['name','stock','price','expiry'],num:['stock','price'],
-  chk:b=>!String(b.name||'').trim()?'Name is required':!(N(b.stock)&&Number.isInteger(+b.stock))?'Stock must be a whole number':!N(b.price)?'Valid price required':!D.test(b.expiry||'')?'Expiry date required':null},
- bills:{r:'admin,reception',w:'admin,reception',pick:['patientId',...NB,'status'],num:NB,
-  chk:b=>!pt(b)?'Select a patient':!NB.every(k=>N(b[k]))?'Amounts must be numbers (0 or more)':+b.discount>+b.consultation+ +b.medicine+ +b.other?'Discount is larger than the bill':!['Unpaid','Paid'].includes(b.status)?'Bad status':null},
- users:{r:'admin',w:'admin',pick:['name','email','role','active','password'],
-  chk:(b,x)=>!String(b.name||'').trim()?'Name is required':!/^\S+@\S+\.\S+$/.test(b.email||'')?'Valid email required':!ROLES.includes(b.role)?'Bad role':db.users.some(u=>u.email===b.email&&u.id!==(x&&x.id))?'Email already used':(!x||b.password)&&String(b.password||'').length<8?'Password min 8 characters':null}};
-const clean=(s,b)=>{const d={};for(const k of s.pick)if(k in b){let v=b[k];if(typeof v==='string')v=v.trim().slice(0,300);if(s.num&&s.num.includes(k))v=(v===''||v==null)?(k==='qty'?'':0):+v;d[k]=v}if('active'in d)d.active=!(d.active===false||d.active==='false');return d};
-const pubU=u=>({id:u.id,name:u.name,email:u.email,role:u.role,active:u.active}),log=(u,a,c,i)=>{db.audit.push({u:u.id,name:u.name,a,c,i,at:Date.now()});if(db.audit.length>500)db.audit.shift()};
-/* ---------- http ---------- */
-const hits=new Map(),limited=(ip,max=10)=>{const n=Date.now(),a=(hits.get(ip)||[]).filter(t=>n-t<6e4);a.push(n);hits.set(ip,a);return a.length>max};
-const MIME={'.html':'text/html; charset=utf-8','.js':'text/javascript','.json':'application/json','.svg':'image/svg+xml','.css':'text/css','.png':'image/png'};
-const body=req=>new Promise((ok,no)=>{let b='';req.on('data',c=>{b+=c;if(b.length>2e5){no(0);req.destroy()}});req.on('end',()=>{try{ok(b?JSON.parse(b):{})}catch{ok({})}})});
-const send=(res,c,o)=>{res.writeHead(c,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify(o))},deny=res=>send(res,403,{error:'Access denied for your role'});
-const server=http.createServer(async(req,res)=>{
- res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','no-referrer');
- const url=new URL(req.url,'http://x'),p=url.pathname;
- if(!p.startsWith('/api/')){const root=path.join(__dirname,'public');let f=path.normalize(path.join(root,p==='/'?'index.html':p));if(!f.startsWith(root)||!fs.existsSync(f)||fs.statSync(f).isDirectory()){res.writeHead(404);return res.end('Not found')}res.writeHead(200,{'content-type':MIME[path.extname(f)]||'application/octet-stream','cache-control':'no-cache'});return fs.createReadStream(f).pipe(res)}
- try{
-  if(p==='/api/ping')return send(res,200,{ok:1});
-  if(p==='/api/health')return send(res,200,{ok:1,db:'JSON file',users:db.users.length});
-  const b=await body(req),m=req.method,ip=String(req.headers['x-forwarded-for']||req.socket.remoteAddress).split(',')[0].trim(),[c,rid]=p.split('/').slice(2);
-  if(p==='/api/login'&&m==='POST'){if(limited(ip))return send(res,429,{error:'Too many attempts. Wait a minute.'});
-   const u=db.users.find(x=>x.email===String(b.email||'').trim().toLowerCase()&&x.active);
-   if(!u||!crypto.timingSafeEqual(Buffer.from(hpw(String(b.password||''),u.salt)),Buffer.from(u.hash)))return send(res,401,{error:'Wrong email or password.'});
-   return send(res,200,{token:sign(u.id),user:pubU(u)})}
-  const sub=verify((req.headers.authorization||'').replace('Bearer ','')),u=db.users.find(x=>x.id===sub&&x.active);if(!u)return send(res,401,{error:'Please sign in again.'});
-  if(p==='/api/me')return send(res,200,{user:pubU(u)});
-  if(p==='/api/doctors')return send(res,200,db.users.filter(x=>x.role==='doctor'&&x.active).map(x=>({id:x.id,name:x.name})));
-  if(p==='/api/stats'){if(u.role!=='admin')return deny(res);const td=new Date().toISOString().slice(0,10),lim=new Date(Date.now()+90*864e5).toISOString().slice(0,10);
-   return send(res,200,{patients:db.patients.length,today:db.appointments.filter(a=>a.date===td&&a.status!=='Cancelled').length,revenue:+db.bills.filter(x=>x.status==='Paid').reduce((s,x)=>s+x.total,0).toFixed(2),unpaid:db.bills.filter(x=>x.status==='Unpaid').length,low:db.medicines.filter(x=>x.stock<=10).length,expiring:db.medicines.filter(x=>x.expiry<=lim).length})}
-  if(p==='/api/audit'){if(u.role!=='admin')return deny(res);return send(res,200,db.audit.slice(-100).reverse())}
-  if(p==='/api/prescriptions'){if(!['admin','pharmacist','doctor'].includes(u.role))return deny(res);
-   return send(res,200,db.records.filter(r=>r.medicineId).map(r=>({id:r.id,patient:(db.patients.find(x=>x.id===r.patientId)||{}).name,medicine:(db.medicines.find(x=>x.id===r.medicineId)||{}).name,qty:r.qty,dispensed:r.dispensed})).reverse())}
-  if(p==='/api/dispense'&&m==='POST'){if(u.role!=='pharmacist')return deny(res);const r=db.records.find(x=>x.id===b.id);if(!r||!r.medicineId)return send(res,404,{error:'Prescription not found'});
-   if(r.dispensed)return send(res,409,{error:'Already dispensed'});const md=db.medicines.find(x=>x.id===r.medicineId);if(!md)return send(res,404,{error:'Medicine not found'});
-   if(md.stock<r.qty)return send(res,409,{error:'Insufficient stock ('+md.stock+' left)'});md.stock-=r.qty;r.dispensed=true;log(u,'dispense','records',r.id);save();return send(res,200,{ok:1})}
-  const s=S[c];if(!s)return send(res,404,{error:'Not found'});const can=k=>s[k].split(',').includes(u.role);
-  if(m==='GET'&&!rid){if(!can('r'))return deny(res);let L=db[c];if(c==='appointments'&&u.role==='doctor')L=L.filter(a=>a.doctor===u.id);return send(res,200,c==='users'?L.map(pubU):L)}
-  if(!can('w'))return deny(res);
-  if(m==='POST'&&!rid){const d=clean(s,b);if(c==='appointments'&&!d.status)d.status='Booked';if(c==='bills'&&!d.status)d.status='Unpaid';if(c==='users'&&d.active===undefined)d.active=true;
-   const er=s.chk(d,null);if(er)return send(res,400,{error:er});const o={id:id(),...d,at:Date.now()};
-   if(c==='records'){o.doctor=u.id;o.dispensed=false}if(c==='bills')o.total=tot(o);
-   if(c==='users'){o.salt=crypto.randomBytes(16).toString('hex');o.hash=hpw(d.password,o.salt);delete o.password}
-   db[c].push(o);log(u,'create',c,o.id);save();return send(res,200,c==='users'?pubU(o):o)}
-  const x=db[c].find(i=>i.id===rid);if(!x)return send(res,404,{error:'Record not found'});
-  if(m==='PUT'){if(c==='bills'&&x.status==='Paid')return send(res,409,{error:'A paid bill cannot be edited'});if(c==='records'&&x.dispensed)return send(res,409,{error:'Dispensed record is locked'});
-   const d=clean(s,b),n={...x,...d};if(c==='users'&&x.id===u.id&&(d.active===false||(d.role&&d.role!==x.role)))return send(res,400,{error:'You cannot disable or change your own role'});
-   const er=s.chk(n,x);if(er)return send(res,400,{error:er});Object.assign(x,d);
-   if(c==='users'){delete x.password;if(d.password){x.salt=crypto.randomBytes(16).toString('hex');x.hash=hpw(d.password,x.salt)}}if(c==='bills')x.total=tot(x);
-   log(u,'update',c,x.id);save();return send(res,200,c==='users'?pubU(x):x)}
-  if(m==='DELETE'){if(c==='bills'&&x.status==='Paid')return send(res,409,{error:'A paid bill cannot be deleted'});if(c==='users'&&x.id===u.id)return send(res,400,{error:'You cannot delete yourself'});
-   if(c==='patients'&&['appointments','records','bills'].some(k=>db[k].some(i=>i.patientId===rid)))return send(res,409,{error:'Patient has linked appointments, records or bills'});
-   db[c]=db[c].filter(i=>i.id!==rid);log(u,'delete',c,rid);save();return send(res,200,{ok:1})}
-  send(res,404,{error:'Not found'})}catch(x){console.error('[ERROR]',req.method,p,x&&x.message||x);send(res,500,{error:'Server error'})}});
-server.on('error',e=>{console.error(e.code==='EADDRINUSE'?'Port '+PORT+' already in use. Close the old server first.':e);process.exit(1)});
-server.listen(PORT,'0.0.0.0',()=>console.log('\n  >>> MediCare HMS running: http://localhost:'+PORT+'  <<<\n'));
-process.on('uncaughtException',e=>console.error('[ERROR-kept-running]',e));
+require("dotenv").config();
+
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const bcrypt = require("bcryptjs");
+const { pool, query } = require("./database");
+
+const PORT = Number(process.env.PORT) || 3100;
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET is required");
+}
+
+/* ---------------- JWT ---------------- */
+
+const b64 = (value) =>
+  Buffer.from(
+    typeof value === "string" ? value : JSON.stringify(value)
+  ).toString("base64url");
+
+const signature = (value) =>
+  crypto
+    .createHmac("sha256", JWT_SECRET)
+    .update(value)
+    .digest("base64url");
+
+function signToken(userId) {
+  const header = b64({ alg: "HS256", typ: "JWT" });
+
+  const payload = b64({
+    sub: String(userId),
+    exp: Math.floor(Date.now() / 1000) + 86400
+  });
+
+  const data = `${header}.${payload}`;
+
+  return `${data}.${signature(data)}`;
+}
+
+function verifyToken(token) {
+  try {
+    const [header, payload, suppliedSignature] =
+      String(token || "").split(".");
+
+    if (!header || !payload || !suppliedSignature) return null;
+
+    const expected = signature(`${header}.${payload}`);
+
+    if (
+      suppliedSignature.length !== expected.length ||
+      !crypto.timingSafeEqual(
+        Buffer.from(suppliedSignature),
+        Buffer.from(expected)
+      )
+    ) {
+      return null;
+    }
+
+    const data = JSON.parse(
+      Buffer.from(payload, "base64url").toString()
+    );
+
+    if (!data.exp || data.exp * 1000 <= Date.now()) return null;
+
+    return data.sub;
+  } catch {
+    return null;
+  }
+}
+
+/* ---------------- HELPERS ---------------- */
+
+const MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg"
+};
+
+function send(res, status, data) {
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store"
+  });
+
+  res.end(JSON.stringify(data));
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+
+    req.on("data", (chunk) => {
+      body += chunk;
+
+      if (body.length > 500000) {
+        reject(new Error("Request too large"));
+        req.destroy();
+      }
+    });
+
+    req.on("end", () => {
+      if (!body) return resolve({});
+
+      try {
+        resolve(JSON.parse(body));
+      } catch {
+        resolve({});
+      }
+    });
+  });
+}
+
+function publicUser(user) {
+  return {
+    id: String(user.id),
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    active: user.active
+  };
+}
+
+async function audit(userId, action, entityType, entityId, details = {}) {
+  try {
+    await query(
+      `
+      INSERT INTO audit_logs
+      (user_id, action, entity_type, entity_id, details)
+      VALUES ($1,$2,$3,$4,$5)
+      `,
+      [
+        userId || null,
+        action,
+        entityType || null,
+        entityId || null,
+        JSON.stringify(details)
+      ]
+    );
+  } catch (error) {
+    console.error("Audit error:", error.message);
+  }
+}
+
+/* ---------------- DATABASE STARTUP ---------------- */
+
+async function initializeDatabase() {
+  await query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id BIGSERIAL PRIMARY KEY,
+      name VARCHAR(120) NOT NULL,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role VARCHAR(30) NOT NULL
+        CHECK (role IN ('admin','patient','doctor','pharmacy','reception')),
+      phone VARCHAR(30),
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS patients (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT UNIQUE REFERENCES users(id) ON DELETE SET NULL,
+      patient_code VARCHAR(30) UNIQUE,
+      name VARCHAR(120) NOT NULL,
+      email VARCHAR(255),
+      phone VARCHAR(30),
+      gender VARCHAR(30),
+      date_of_birth DATE,
+      blood_group VARCHAR(10),
+      address TEXT,
+      emergency_contact VARCHAR(120),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS doctors (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT UNIQUE REFERENCES users(id) ON DELETE SET NULL,
+      doctor_code VARCHAR(30) UNIQUE,
+      name VARCHAR(120) NOT NULL,
+      specialization VARCHAR(120),
+      phone VARCHAR(30),
+      email VARCHAR(255),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS appointments (
+      id BIGSERIAL PRIMARY KEY,
+      patient_id BIGINT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+      doctor_id BIGINT REFERENCES doctors(id) ON DELETE SET NULL,
+      appointment_date DATE NOT NULL,
+      appointment_time TIME,
+      reason TEXT,
+      status VARCHAR(30) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','confirmed','completed','cancelled')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS medical_records (
+      id BIGSERIAL PRIMARY KEY,
+      patient_id BIGINT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+      doctor_id BIGINT REFERENCES doctors(id) ON DELETE SET NULL,
+      appointment_id BIGINT REFERENCES appointments(id) ON DELETE SET NULL,
+      diagnosis TEXT,
+      symptoms TEXT,
+      treatment TEXT,
+      notes TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS medicines (
+      id BIGSERIAL PRIMARY KEY,
+      name VARCHAR(160) NOT NULL,
+      generic_name VARCHAR(160),
+      batch_number VARCHAR(100),
+      quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+      unit_price NUMERIC(12,2) NOT NULL DEFAULT 0,
+      expiry_date DATE,
+      supplier VARCHAR(160),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS prescriptions (
+      id BIGSERIAL PRIMARY KEY,
+      patient_id BIGINT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+      doctor_id BIGINT REFERENCES doctors(id) ON DELETE SET NULL,
+      appointment_id BIGINT REFERENCES appointments(id) ON DELETE SET NULL,
+      notes TEXT,
+      status VARCHAR(30) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active','dispensed','cancelled')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS prescription_items (
+      id BIGSERIAL PRIMARY KEY,
+      prescription_id BIGINT NOT NULL
+        REFERENCES prescriptions(id) ON DELETE CASCADE,
+      medicine_id BIGINT REFERENCES medicines(id) ON DELETE SET NULL,
+      medicine_name VARCHAR(160) NOT NULL,
+      dosage VARCHAR(100),
+      frequency VARCHAR(100),
+      duration VARCHAR(100),
+      instructions TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS dispensations (
+      id BIGSERIAL PRIMARY KEY,
+      prescription_id BIGINT REFERENCES prescriptions(id) ON DELETE SET NULL,
+      patient_id BIGINT REFERENCES patients(id) ON DELETE SET NULL,
+      pharmacist_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+      total_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+      dispensed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS bills (
+      id BIGSERIAL PRIMARY KEY,
+      patient_id BIGINT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+      appointment_id BIGINT REFERENCES appointments(id) ON DELETE SET NULL,
+      amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+      payment_method VARCHAR(30),
+      payment_status VARCHAR(30) NOT NULL DEFAULT 'pending'
+        CHECK (payment_status IN ('pending','paid','cancelled')),
+      description TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      paid_at TIMESTAMPTZ
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+      action VARCHAR(160) NOT NULL,
+      entity_type VARCHAR(80),
+      entity_id BIGINT,
+      details JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  const adminEmail = String(
+    process.env.ADMIN_EMAIL || "admin@hospital.local"
+  )
+    .trim()
+    .toLowerCase();
+
+  const adminPassword = process.env.ADMIN_PASSWORD;
+
+  if (!adminPassword) {
+    console.warn(
+      "ADMIN_PASSWORD is not configured. Existing admin accounts can still login."
+    );
+    return;
+  }
+
+  const existing = await query(
+    `SELECT id FROM users WHERE email=$1 LIMIT 1`,
+    [adminEmail]
+  );
+
+  if (!existing.rows.length) {
+    const hash = await bcrypt.hash(adminPassword, 12);
+
+    await query(
+      `
+      INSERT INTO users
+      (name,email,password_hash,role,active)
+      VALUES ($1,$2,$3,'admin',TRUE)
+      `,
+      ["Hospital Administrator", adminEmail, hash]
+    );
+
+    console.log("Initial administrator created.");
+  }
+}
+
+/* ---------------- AUTH ---------------- */
+
+async function authenticatedUser(req) {
+  const token = String(req.headers.authorization || "")
+    .replace(/^Bearer\s+/i, "");
+
+  const userId = verifyToken(token);
+
+  if (!userId) return null;
+
+  const result = await query(
+    `
+    SELECT id,name,email,role,active
+    FROM users
+    WHERE id=$1 AND active=TRUE
+    LIMIT 1
+    `,
+    [userId]
+  );
+
+  return result.rows[0] || null;
+}
+
+function allowed(user, roles) {
+  return user && roles.includes(user.role);
+}
+
+/* ---------------- SERVER ---------------- */
+
+const server = http.createServer(async (req, res) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+
+  const url = new URL(req.url, "http://localhost");
+  const pathname = url.pathname;
+
+  if (!pathname.startsWith("/api/")) {
+    const publicRoot = path.join(__dirname, "public");
+
+    let requested = pathname === "/" ? "index.html" : pathname.slice(1);
+
+    const file = path.normalize(path.join(publicRoot, requested));
+
+    if (
+      !file.startsWith(publicRoot) ||
+      !fs.existsSync(file) ||
+      fs.statSync(file).isDirectory()
+    ) {
+      res.writeHead(404);
+      return res.end("Not found");
+    }
+
+    res.writeHead(200, {
+      "content-type":
+        MIME[path.extname(file).toLowerCase()] ||
+        "application/octet-stream",
+      "cache-control": "no-cache"
+    });
+
+    return fs.createReadStream(file).pipe(res);
+  }
+
+  try {
+    const method = req.method;
+    const body = await readBody(req);
+
+    /* HEALTH */
+
+    if (pathname === "/api/ping") {
+      return send(res, 200, { ok: true });
+    }
+
+    if (pathname === "/api/health") {
+      const db = await query(
+        `SELECT current_database() AS database, NOW() AS time`
+      );
+
+      return send(res, 200, {
+        ok: true,
+        database: "Neon PostgreSQL",
+        databaseName: db.rows[0].database,
+        time: db.rows[0].time
+      });
+    }
+
+    /* LOGIN */
+
+    if (pathname === "/api/login" && method === "POST") {
+      const email = String(body.email || "")
+        .trim()
+        .toLowerCase();
+
+      const password = String(body.password || "");
+
+      if (!email || !password) {
+        return send(res, 400, {
+          error: "Email and password are required."
+        });
+      }
+
+      const result = await query(
+        `
+        SELECT *
+        FROM users
+        WHERE LOWER(email)=LOWER($1)
+          AND active=TRUE
+        LIMIT 1
+        `,
+        [email]
+      );
+
+      const user = result.rows[0];
+
+      if (
+        !user ||
+        !(await bcrypt.compare(password, user.password_hash))
+      ) {
+        return send(res, 401, {
+          error: "Wrong email or password."
+        });
+      }
+
+      await audit(user.id, "login", "users", user.id);
+
+      return send(res, 200, {
+        token: signToken(user.id),
+        user: publicUser(user)
+      });
+    }
+
+    const user = await authenticatedUser(req);
+
+    if (!user) {
+      return send(res, 401, {
+        error: "Please sign in again."
+      });
+    }
+
+    /* CURRENT USER */
+
+    if (pathname === "/api/me") {
+      return send(res, 200, {
+        user: publicUser(user)
+      });
+    }
+
+    /* USERS */
+
+    if (pathname === "/api/users" && method === "GET") {
+      if (!allowed(user, ["admin"])) {
+        return send(res, 403, { error: "Access denied." });
+      }
+
+      const result = await query(`
+        SELECT id,name,email,role,phone,active,created_at
+        FROM users
+        ORDER BY created_at DESC
+      `);
+
+      return send(res, 200, result.rows);
+    }
+
+    if (pathname === "/api/users" && method === "POST") {
+      if (!allowed(user, ["admin"])) {
+        return send(res, 403, { error: "Access denied." });
+      }
+
+      const name = String(body.name || "").trim();
+      const email = String(body.email || "")
+        .trim()
+        .toLowerCase();
+
+      const password = String(body.password || "");
+      let role = String(body.role || "").toLowerCase();
+
+      if (role === "pharmacist") role = "pharmacy";
+
+      const roles = [
+        "admin",
+        "patient",
+        "doctor",
+        "pharmacy",
+        "reception"
+      ];
+
+      if (!name || !email || password.length < 8 || !roles.includes(role)) {
+        return send(res, 400, {
+          error:
+            "Name, valid role and password of at least 8 characters are required."
+        });
+      }
+
+      const duplicate = await query(
+        `SELECT id FROM users WHERE LOWER(email)=LOWER($1)`,
+        [email]
+      );
+
+      if (duplicate.rows.length) {
+        return send(res, 409, {
+          error: "Email already exists."
+        });
+      }
+
+      const hash = await bcrypt.hash(password, 12);
+
+      const result = await query(
+        `
+        INSERT INTO users
+        (name,email,password_hash,role,phone,active)
+        VALUES ($1,$2,$3,$4,$5,TRUE)
+        RETURNING id,name,email,role,phone,active,created_at
+        `,
+        [name, email, hash, role, body.phone || null]
+      );
+
+      const created = result.rows[0];
+
+      if (role === "patient") {
+        await query(
+          `
+          INSERT INTO patients
+          (user_id,patient_code,name,email,phone)
+          VALUES ($1,$2,$3,$4,$5)
+          `,
+          [
+            created.id,
+            `PAT-${String(created.id).padStart(5, "0")}`,
+            name,
+            email,
+            body.phone || null
+          ]
+        );
+      }
+
+      if (role === "doctor") {
+        await query(
+          `
+          INSERT INTO doctors
+          (user_id,doctor_code,name,email,phone,specialization)
+          VALUES ($1,$2,$3,$4,$5,$6)
+          `,
+          [
+            created.id,
+            `DOC-${String(created.id).padStart(5, "0")}`,
+            name,
+            email,
+            body.phone || null,
+            body.specialization || null
+          ]
+        );
+      }
+
+      await audit(user.id, "create", "users", created.id, {
+        role
+      });
+
+      return send(res, 201, created);
+    }
+
+    /* DOCTORS */
+
+    if (pathname === "/api/doctors" && method === "GET") {
+      const result = await query(`
+        SELECT
+          d.id,
+          d.user_id AS "userId",
+          d.name,
+          d.specialization,
+          d.email,
+          d.phone
+        FROM doctors d
+        JOIN users u ON u.id=d.user_id
+        WHERE u.active=TRUE
+        ORDER BY d.name
+      `);
+
+      return send(res, 200, result.rows);
+    }
+
+    /* PATIENTS */
+
+    if (pathname === "/api/patients" && method === "GET") {
+      if (
+        !allowed(user, [
+          "admin",
+          "reception",
+          "doctor",
+          "pharmacy",
+          "patient"
+        ])
+      ) {
+        return send(res, 403, { error: "Access denied." });
+      }
+
+      let result;
+
+      if (user.role === "patient") {
+        result = await query(
+          `
+          SELECT *
+          FROM patients
+          WHERE user_id=$1
+          `,
+          [user.id]
+        );
+      } else {
+        result = await query(`
+          SELECT *
+          FROM patients
+          ORDER BY created_at DESC
+        `);
+      }
+
+      return send(res, 200, result.rows);
+    }
+
+    if (pathname === "/api/patients" && method === "POST") {
+      if (!allowed(user, ["admin", "reception"])) {
+        return send(res, 403, { error: "Access denied." });
+      }
+
+      const name = String(body.name || "").trim();
+      const phone = String(body.phone || "").trim();
+
+      if (!name) {
+        return send(res, 400, {
+          error: "Patient name is required."
+        });
+      }
+
+      const result = await query(
+        `
+        INSERT INTO patients
+        (
+          patient_code,
+          name,
+          email,
+          phone,
+          gender,
+          date_of_birth,
+          blood_group,
+          address,
+          emergency_contact
+        )
+        VALUES
+        (
+          'PAT-' || LPAD(nextval('patients_id_seq')::TEXT,5,'0'),
+          $1,$2,$3,$4,$5,$6,$7,$8
+        )
+        RETURNING *
+        `,
+        [
+          name,
+          body.email || null,
+          phone || null,
+          body.gender || null,
+          body.date_of_birth || null,
+          body.blood_group || null,
+          body.address || null,
+          body.emergency_contact || null
+        ]
+      );
+
+      await audit(
+        user.id,
+        "create",
+        "patients",
+        result.rows[0].id
+      );
+
+      return send(res, 201, result.rows[0]);
+    }
+
+    /* APPOINTMENTS */
+
+    if (pathname === "/api/appointments" && method === "GET") {
+      let sql = `
+        SELECT
+          a.*,
+          p.name AS patient_name,
+          d.name AS doctor_name
+        FROM appointments a
+        JOIN patients p ON p.id=a.patient_id
+        LEFT JOIN doctors d ON d.id=a.doctor_id
+      `;
+
+      const params = [];
+
+      if (user.role === "patient") {
+        sql += `
+          WHERE p.user_id=$1
+        `;
+        params.push(user.id);
+      } else if (user.role === "doctor") {
+        sql += `
+          WHERE d.user_id=$1
+        `;
+        params.push(user.id);
+      } else if (
+        !allowed(user, ["admin", "reception", "pharmacy"])
+      ) {
+        return send(res, 403, { error: "Access denied." });
+      }
+
+      sql += ` ORDER BY a.appointment_date DESC, a.appointment_time DESC`;
+
+      const result = await query(sql, params);
+
+      return send(res, 200, result.rows);
+    }
+
+    if (pathname === "/api/appointments" && method === "POST") {
+      if (
+        !allowed(user, ["admin", "reception", "patient"])
+      ) {
+        return send(res, 403, { error: "Access denied." });
+      }
+
+      let patientId = body.patientId || body.patient_id;
+
+      if (user.role === "patient") {
+        const patient = await query(
+          `SELECT id FROM patients WHERE user_id=$1 LIMIT 1`,
+          [user.id]
+        );
+
+        if (!patient.rows.length) {
+          return send(res, 400, {
+            error: "Patient profile not found."
+          });
+        }
+
+        patientId = patient.rows[0].id;
+      }
+
+      const doctorId = body.doctorId || body.doctor_id;
+
+      if (
+        !patientId ||
+        !doctorId ||
+        !body.date ||
+        !body.time
+      ) {
+        return send(res, 400, {
+          error:
+            "Patient, doctor, date and time are required."
+        });
+      }
+
+      const result = await query(
+        `
+        INSERT INTO appointments
+        (
+          patient_id,
+          doctor_id,
+          appointment_date,
+          appointment_time,
+          reason,
+          status
+        )
+        VALUES ($1,$2,$3,$4,$5,$6)
+        RETURNING *
+        `,
+        [
+          patientId,
+          doctorId,
+          body.date,
+          body.time,
+          body.reason || null,
+          String(body.status || "pending").toLowerCase()
+        ]
+      );
+
+      await audit(
+        user.id,
+        "create",
+        "appointments",
+        result.rows[0].id
+      );
+
+      return send(res, 201, result.rows[0]);
+    }
+
+    /* MEDICAL RECORDS */
+
+    if (pathname === "/api/records" && method === "GET") {
+      let sql = `
+        SELECT
+          mr.*,
+          p.name AS patient_name,
+          d.name AS doctor_name
+        FROM medical_records mr
+        JOIN patients p ON p.id=mr.patient_id
+        LEFT JOIN doctors d ON d.id=mr.doctor_id
+      `;
+
+      const params = [];
+
+      if (user.role === "patient") {
+        sql += ` WHERE p.user_id=$1 `;
+        params.push(user.id);
+      } else if (
+        !allowed(user, ["admin", "doctor"])
+      ) {
+        return send(res, 403, { error: "Access denied." });
+      }
+
+      sql += ` ORDER BY mr.created_at DESC`;
+
+      const result = await query(sql, params);
+
+      return send(res, 200, result.rows);
+    }
+
+    /* MEDICINES */
+
+    if (pathname === "/api/medicines" && method === "GET") {
+      if (
+        !allowed(user, [
+          "admin",
+          "doctor",
+          "pharmacy"
+        ])
+      ) {
+        return send(res, 403, { error: "Access denied." });
+      }
+
+      const result = await query(`
+        SELECT *
+        FROM medicines
+        ORDER BY name
+      `);
+
+      return send(res, 200, result.rows);
+    }
+
+    if (pathname === "/api/medicines" && method === "POST") {
+      if (!allowed(user, ["admin", "pharmacy"])) {
+        return send(res, 403, { error: "Access denied." });
+      }
+
+      if (!String(body.name || "").trim()) {
+        return send(res, 400, {
+          error: "Medicine name is required."
+        });
+      }
+
+      const result = await query(
+        `
+        INSERT INTO medicines
+        (
+          name,
+          generic_name,
+          batch_number,
+          quantity,
+          unit_price,
+          expiry_date,
+          supplier
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+        RETURNING *
+        `,
+        [
+          String(body.name).trim(),
+          body.generic_name || null,
+          body.batch_number || null,
+          Number(body.quantity ?? body.stock ?? 0),
+          Number(body.unit_price ?? body.price ?? 0),
+          body.expiry_date || body.expiry || null,
+          body.supplier || null
+        ]
+      );
+
+      await audit(
+        user.id,
+        "create",
+        "medicines",
+        result.rows[0].id
+      );
+
+      return send(res, 201, result.rows[0]);
+    }
+
+    /* PRESCRIPTIONS */
+
+    if (pathname === "/api/prescriptions" && method === "GET") {
+      let sql = `
+        SELECT
+          pr.*,
+          p.name AS patient_name,
+          d.name AS doctor_name
+        FROM prescriptions pr
+        JOIN patients p ON p.id=pr.patient_id
+        LEFT JOIN doctors d ON d.id=pr.doctor_id
+      `;
+
+      const params = [];
+
+      if (user.role === "patient") {
+        sql += ` WHERE p.user_id=$1 `;
+        params.push(user.id);
+      } else if (
+        !allowed(user, [
+          "admin",
+          "doctor",
+          "pharmacy"
+        ])
+      ) {
+        return send(res, 403, { error: "Access denied." });
+      }
+
+      sql += ` ORDER BY pr.created_at DESC`;
+
+      const result = await query(sql, params);
+
+      return send(res, 200, result.rows);
+    }
+
+    /* BILLS */
+
+    if (pathname === "/api/bills" && method === "GET") {
+      let sql = `
+        SELECT
+          b.*,
+          p.name AS patient_name
+        FROM bills b
+        JOIN patients p ON p.id=b.patient_id
+      `;
+
+      const params = [];
+
+      if (user.role === "patient") {
+        sql += ` WHERE p.user_id=$1 `;
+        params.push(user.id);
+      } else if (
+        !allowed(user, ["admin", "reception"])
+      ) {
+        return send(res, 403, { error: "Access denied." });
+      }
+
+      sql += ` ORDER BY b.created_at DESC`;
+
+      const result = await query(sql, params);
+
+      return send(res, 200, result.rows);
+    }
+
+    /* ADMIN DASHBOARD */
+
+    if (pathname === "/api/stats") {
+      if (!allowed(user, ["admin"])) {
+        return send(res, 403, { error: "Access denied." });
+      }
+
+      const result = await query(`
+        SELECT
+          (SELECT COUNT(*) FROM patients)::INT AS patients,
+
+          (
+            SELECT COUNT(*)
+            FROM appointments
+            WHERE appointment_date=CURRENT_DATE
+              AND status <> 'cancelled'
+          )::INT AS today,
+
+          (
+            SELECT COALESCE(SUM(amount),0)
+            FROM bills
+            WHERE payment_status='paid'
+          )::NUMERIC AS revenue,
+
+          (
+            SELECT COUNT(*)
+            FROM bills
+            WHERE payment_status='pending'
+          )::INT AS unpaid,
+
+          (
+            SELECT COUNT(*)
+            FROM medicines
+            WHERE quantity <= 10
+          )::INT AS low,
+
+          (
+            SELECT COUNT(*)
+            FROM medicines
+            WHERE expiry_date IS NOT NULL
+              AND expiry_date <= CURRENT_DATE + INTERVAL '90 days'
+          )::INT AS expiring
+      `);
+
+      return send(res, 200, result.rows[0]);
+    }
+
+    /* AUDIT */
+
+    if (pathname === "/api/audit") {
+      if (!allowed(user, ["admin"])) {
+        return send(res, 403, { error: "Access denied." });
+      }
+
+      const result = await query(`
+        SELECT
+          a.*,
+          u.name AS user_name
+        FROM audit_logs a
+        LEFT JOIN users u ON u.id=a.user_id
+        ORDER BY a.created_at DESC
+        LIMIT 100
+      `);
+
+      return send(res, 200, result.rows);
+    }
+
+    return send(res, 404, {
+      error: "API route not found."
+    });
+  } catch (error) {
+    console.error("[SERVER ERROR]", error);
+
+    return send(res, 500, {
+      error: "Server error."
+    });
+  }
+});
+
+/* ---------------- STARTUP ---------------- */
+
+async function start() {
+  try {
+    await initializeDatabase();
+
+    const check = await query(
+      `SELECT current_database() AS database`
+    );
+
+    console.log(
+      `Connected to Neon PostgreSQL: ${check.rows[0].database}`
+    );
+
+    server.listen(PORT, "0.0.0.0", () => {
+      console.log(
+        `MediCare HMS running: http://localhost:${PORT}`
+      );
+    });
+  } catch (error) {
+    console.error("APPLICATION STARTUP FAILED");
+    console.error(error);
+    process.exit(1);
+  }
+}
+
+process.on("SIGTERM", async () => {
+  server.close(async () => {
+    await pool.end();
+    process.exit(0);
+  });
+});
+
+start();
