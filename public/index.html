@@ -41,6 +41,29 @@ svg.ico{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.9;st
 .mobilemenu{display:none}
 @media(max-width:1100px){.stats{grid-template-columns:repeat(3,1fr)}.grid2{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:820px){.auth{grid-template-columns:1fr}.auth-art{display:none}.auth-side{min-height:100vh;padding:18px}.auth-card{padding:25px;border-radius:26px}.app{grid-template-columns:1fr}.sidebar{position:fixed;left:-290px;width:270px;transition:.25s;box-shadow:var(--shadow)}.sidebar.open{left:0}.mobilemenu{display:grid}.content{padding:18px}.topbar{padding:0 16px}.stats{grid-template-columns:repeat(2,1fr)}.cards{grid-template-columns:1fr}.pagehead{align-items:flex-start;flex-direction:column}.pagehead .actions{margin-left:0}.formgrid{grid-template-columns:1fr}.full{grid-column:auto}}
+/* FIX: Keep sidebar and sign-out area visible */
+.sidebar {
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.sidebar nav,
+.sidebar .nav {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+.sidebar .user-card,
+.sidebar .account-card,
+.sidebar .sidebar-user {
+    margin-top: auto;
+    flex-shrink: 0;
+}
 </style>
 </head>
 <body>
